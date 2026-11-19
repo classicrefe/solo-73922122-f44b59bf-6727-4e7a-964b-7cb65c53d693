@@ -1,15 +1,16 @@
-"""FastAPI 入口：补录、唯一索引构建的发起/查询/取消。"""
+"""FastAPI 入口：补录、唯一索引构建的发起/查询/取消、测值漂移核算。"""
 from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import date
 
 import psycopg
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Query, status
 
-from . import db
+from . import db, drift
 from .responses import AppJSONResponse
-from .schemas import BatchReportIn, ReportIn, ReportOut
+from .schemas import BatchReportIn, DriftConclusionOut, ReportIn, ReportOut
 from .service import service
 
 logging.basicConfig(
@@ -22,6 +23,8 @@ log = logging.getLogger("api")
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     db.init_pool()
+    # 幂等确保漂移表/函数/触发器就位（已存在对象时全部 IF NOT EXISTS / CREATE OR REPLACE）。
+    db.ensure_schema()
     service.reconcile_on_startup()
     try:
         yield
@@ -30,13 +33,15 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(
-    title="检验报告唯一性保障 API",
+    title="检验报告质控 API（唯一性保障 + 漂移核算）",
     description=(
-        "对持续补录的 reports 表在线构建 (lab_no, report_no) 唯一索引；"
-        "支持发起、查询、取消 CREATE UNIQUE INDEX CONCURRENTLY，"
-        "构建期间补录不阻塞，API 重启后接续跟踪。"
+        "1) 对持续补录的 reports 表在线构建 (lab_no, report_no) 唯一索引，"
+        "支持发起、查询、取消 CREATE UNIQUE INDEX CONCURRENTLY，构建期间补录不阻塞；"
+        "2) 按实验室号与 reports.created_at 的 UTC 日期核算测值整体漂移："
+        "比较当日中位数与此前七个 UTC 日全部测值中位数，阈值 10，"
+        "结论落库且在报告增改删时由数据库触发器自动标过期。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     default_response_class=AppJSONResponse,
     lifespan=lifespan,
 )
@@ -141,3 +146,56 @@ def cancel_build(round_id: str | None = None):
     """
     view, code = service.request_cancel(round_id)
     return AppJSONResponse(view, status_code=code)
+
+
+# --------------------------- 测值漂移核算 --------------------------------
+
+@app.post("/drift/conclusions", response_model=DriftConclusionOut, status_code=201)
+def compute_drift_conclusion(
+    lab_no: str = Query(..., min_length=1, description="实验室号"),
+    calc_date: date | None = Query(
+        None, description="被核算的 UTC 日期（YYYY-MM-DD）；缺省取当前 UTC 日期"
+    ),
+    force: bool = Query(
+        False, description="TRUE=强制重新核算；FALSE=已有未过期结论时直接复用（200, reused=true）"
+    ),
+):
+    """按 UTC 日期核算某实验室的测值漂移并保存结论。
+
+    - 当日侧：created_at 的 UTC 日期等于 calc_date 的全部测值中位数；
+    - 基线侧：此前七个 UTC 日 [calc_date-7, calc_date) 全部测值中位数；
+    - 两侧在同一事务、同一快照读取；任一侧无报告 -> insufficient_data；
+    - |差值| > 10 -> needs_review=true（差值恰好 10 不标记）；
+    - 报告增改删会由触发器把受影响日期及其后七日的同实验室结论标为过期，
+      重新核算（force=true 或自动）后 is_stale 恢复 false。
+    """
+    view, code = drift.compute_drift(lab_no=lab_no, calc_date=calc_date, force=force)
+    return AppJSONResponse(view, status_code=code)
+
+
+@app.get("/drift/conclusions/{lab_no}/{calc_date}",
+         response_model=DriftConclusionOut)
+def get_drift_conclusion(lab_no: str, calc_date: date):
+    """查询单个已保存的漂移结论；从未核算过返回 404。"""
+    row = drift.get_conclusion(lab_no, calc_date)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "conclusion_not_found",
+                "message": "该（实验室号, UTC 日期）尚无核算结论，请先调用 POST /drift/conclusions",
+                "lab_no": lab_no,
+                "calc_date": calc_date.isoformat(),
+            },
+        )
+    return drift._to_view(row)
+
+
+@app.get("/drift/conclusions")
+def list_drift_conclusions(
+    lab_no: str | None = Query(None, description="可选：只看某实验室"),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """分页列出已保存的漂移结论（含过期结论，is_stale=true 表示需重新核算）。"""
+    return drift.list_conclusions(lab_no=lab_no, limit=limit, offset=offset)

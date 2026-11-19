@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from fastapi.responses import JSONResponse
 
@@ -13,6 +13,8 @@ class _Encoder(json.JSONEncoder):
         if isinstance(o, uuid.UUID):
             return str(o)
         if isinstance(o, datetime):
+            return o.isoformat()
+        if isinstance(o, date):
             return o.isoformat()
         return super().default(o)
 

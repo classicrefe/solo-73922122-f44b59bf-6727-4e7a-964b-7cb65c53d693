@@ -9,7 +9,7 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      # 首次初始化自动建表（幂等）
+      # 首次初始化自动建表（幂等）：报告表、轮次表、漂移表、核算函数与触发器
       - ./sql/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d report_warehouse"]
